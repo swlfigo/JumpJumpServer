@@ -300,6 +300,66 @@ func TestDisconnectForfeits(t *testing.T) {
 	}
 }
 
+func TestPlayersGetDistinctColors(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxPlayers = paletteSize
+	url := startServer(t, cfg)
+	var last welcomeMessage
+	for i := range paletteSize {
+		c := dial(t, url)
+		c.send(map[string]any{"type": "join", "name": string(rune('A' + i)), "roomCode": "colors"})
+		last = expect[welcomeMessage](c, "welcome")
+	}
+	seen := map[int]bool{}
+	for _, p := range last.Players {
+		if p.Color < 0 || p.Color >= paletteSize || seen[p.Color] {
+			t.Fatalf("color %d out of range or repeated: %+v", p.Color, last.Players)
+		}
+		seen[p.Color] = true
+	}
+}
+
+func TestUnreadyMemberIsWarnedThenRemoved(t *testing.T) {
+	cfg := testConfig()
+	cfg.ReadyTimeout, cfg.ReadyWarning = 400*time.Millisecond, 250*time.Millisecond
+	url := startServer(t, cfg)
+	a, b := dial(t, url), dial(t, url)
+	aID := a.join("A", "room")
+	b.join("B", "room")
+	a.send(map[string]any{"type": "ready"})
+	if got := expect[readyWarningMessage](b, "readyWarning"); got.SecondsLeft != 1 {
+		t.Fatalf("ready warning: %+v", got)
+	}
+	b.expectError("ready_timeout")
+	b.expectClosed()
+	// A readied in time and stays, now alone in the room.
+	for {
+		lobby := expect[lobbyMessage](a, "lobby")
+		if len(lobby.Players) == 1 && lobby.Players[0].PlayerID == aID && lobby.Players[0].Ready {
+			break
+		}
+	}
+}
+
+func TestReadyClockRestartsAfterRace(t *testing.T) {
+	cfg := testConfig()
+	cfg.ReadyTimeout, cfg.ReadyWarning = 400*time.Millisecond, 250*time.Millisecond
+	url := startServer(t, cfg)
+	a, b := dial(t, url), dial(t, url)
+	a.join("A", "room")
+	b.join("B", "room")
+	startMatch(t, a, b)
+	time.Sleep(500 * time.Millisecond) // longer than the ready timeout
+	a.jump(1, 3000)
+	b.jump(1, 3000)
+	expect[resultMessage](a, "result")
+	// Without the restart both would be removed at once, with no warning.
+	for _, c := range []*testClient{a, b} {
+		expect[readyWarningMessage](c, "readyWarning")
+		c.expectError("ready_timeout")
+	}
+}
+
 func TestRoomFullAndBusy(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxPlayers = 2

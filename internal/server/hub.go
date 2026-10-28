@@ -20,6 +20,8 @@ type Config struct {
 	Countdown            time.Duration
 	IdleTimeout          time.Duration // no jump for this long forfeits the match
 	IdleWarning          time.Duration // warn this long before the idle timeout
+	ReadyTimeout         time.Duration // a lobby member who has not readied by then is removed
+	ReadyWarning         time.Duration // warn this long before the ready timeout
 	Settle               time.Duration // client landing recovery before the next charge
 	JitterTolerance      time.Duration // network slack in the jump timing check
 	PingInterval         time.Duration
@@ -35,6 +37,8 @@ func DefaultConfig() Config {
 		Countdown:            3 * time.Second,
 		IdleTimeout:          time.Minute,
 		IdleWarning:          15 * time.Second,
+		ReadyTimeout:         15 * time.Second,
+		ReadyWarning:         5 * time.Second,
 		Settle:               200 * time.Millisecond,
 		JitterTolerance:      300 * time.Millisecond,
 		PingInterval:         10 * time.Second,
@@ -72,6 +76,9 @@ func NewHub(cfg Config, log *slog.Logger) *Hub {
 	if cfg.IdleWarning >= cfg.IdleTimeout {
 		cfg.IdleWarning = cfg.IdleTimeout / 4
 	}
+	if cfg.ReadyWarning >= cfg.ReadyTimeout {
+		cfg.ReadyWarning = cfg.ReadyTimeout / 3
+	}
 	return &Hub{cfg: cfg, log: log, events: make(chan event), stopped: make(chan struct{}), rooms: map[string]*room{}}
 }
 
@@ -87,7 +94,9 @@ func (h *Hub) Run(ctx context.Context) {
 			h.handle(ev, time.Now())
 		case now := <-ticker.C:
 			for _, r := range h.rooms {
-				r.tick(now)
+				for _, c := range r.tick(now) {
+					h.kick(c, "ready_timeout", "did not ready in time", now)
+				}
 			}
 		}
 	}
@@ -245,7 +254,7 @@ func (h *Hub) join(c *client, msg clientMessage, now time.Time) {
 	case len(r.members) >= h.cfg.MaxPlayers:
 		h.kick(c, "room_full", "room is full", now)
 	default:
-		r.add(c, name)
+		r.add(c, name, now)
 	}
 }
 

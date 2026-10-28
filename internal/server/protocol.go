@@ -24,6 +24,7 @@ type playerInfo struct {
 	PlayerID int    `json:"playerID"`
 	Name     string `json:"name"`
 	Ready    bool   `json:"ready"`
+	Color    int    `json:"color"` // slot in the client's palette, unique within the room
 }
 
 type welcomeMessage struct {
@@ -58,6 +59,11 @@ type jumpedMessage struct {
 	Result      string    `json:"result"`
 	Score       int       `json:"score"`
 	Combo       int       `json:"combo"`
+}
+
+type readyWarningMessage struct {
+	Type        string `json:"type"`
+	SecondsLeft int    `json:"secondsLeft"`
 }
 
 type idleWarningMessage struct {

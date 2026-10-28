@@ -29,6 +29,7 @@ type room struct {
 type member struct {
 	id     int
 	name   string
+	color  int
 	client *client
 	room   *room
 	ready  bool
@@ -38,15 +39,18 @@ type member struct {
 	readyAt  time.Time // earliest the next charge may begin: landing plus settle
 	lastJump time.Time // idle timer base
 	warned   bool
-	out      string // reason; empty while still racing
-	outAt    time.Time
+	// Lobby: when this member last became unready (joined, or a race ended).
+	lobbySince  time.Time
+	readyWarned bool
+	out         string // reason; empty while still racing
+	outAt       time.Time
 }
 
 func (r *room) racing() bool { return r.racers != nil }
 
-func (r *room) add(c *client, name string) {
+func (r *room) add(c *client, name string, now time.Time) {
 	r.nextID++
-	m := &member{id: r.nextID, name: name, client: c, room: r}
+	m := &member{id: r.nextID, name: name, color: r.freeColor(), client: c, room: r, lobbySince: now}
 	c.member = m
 	r.members = append(r.members, m)
 	r.log.Info("join", "player", m.id, "name", name)
@@ -60,7 +64,7 @@ func (r *room) remove(m *member, reason string, now time.Time) {
 	if r.racing() {
 		if m.out == "" {
 			r.markOut(m, reason, now)
-			r.finishIfDone()
+			r.finishIfDone(now)
 		}
 		return
 	}
@@ -142,13 +146,15 @@ func (r *room) jump(m *member, msg clientMessage, now time.Time) {
 	})
 	if jump.Result == game.Miss {
 		r.markOut(m, reasonFell, now)
-		r.finishIfDone()
+		r.finishIfDone(now)
 	}
 }
 
-func (r *room) tick(now time.Time) {
+// tick runs the timers and returns lobby members who never readied, for the
+// hub to remove.
+func (r *room) tick(now time.Time) []*client {
 	if !r.racing() {
-		return
+		return r.readyCheck(now)
 	}
 	for _, m := range r.racers {
 		if m.out != "" {
@@ -164,7 +170,29 @@ func (r *room) tick(now time.Time) {
 			m.client.enqueue(idleWarningMessage{Type: "idleWarning", SecondsLeft: int(math.Ceil(left.Seconds()))})
 		}
 	}
-	r.finishIfDone()
+	r.finishIfDone(now)
+	return nil
+}
+
+// readyCheck warns lobby members who have not readied and returns those whose
+// time is up, so nobody can hold a room without playing.
+func (r *room) readyCheck(now time.Time) []*client {
+	var expired []*client
+	for _, m := range r.members {
+		if m.ready {
+			continue
+		}
+		waited := now.Sub(m.lobbySince)
+		switch {
+		case waited >= r.cfg.ReadyTimeout:
+			expired = append(expired, m.client)
+		case !m.readyWarned && waited >= r.cfg.ReadyTimeout-r.cfg.ReadyWarning:
+			m.readyWarned = true
+			left := r.cfg.ReadyTimeout - waited
+			m.client.enqueue(readyWarningMessage{Type: "readyWarning", SecondsLeft: int(math.Ceil(left.Seconds()))})
+		}
+	}
+	return expired
 }
 
 func (r *room) markOut(m *member, reason string, now time.Time) {
@@ -173,7 +201,7 @@ func (r *room) markOut(m *member, reason string, now time.Time) {
 	r.broadcast(outMessage{Type: "out", PlayerID: m.id, Reason: reason})
 }
 
-func (r *room) finishIfDone() {
+func (r *room) finishIfDone(now time.Time) {
 	if !r.racing() {
 		return
 	}
@@ -186,6 +214,9 @@ func (r *room) finishIfDone() {
 	r.log.Info("result", "ranking", ranking)
 	r.broadcast(resultMessage{Type: "result", Ranking: ranking})
 	r.racers, r.course = nil, nil
+	for _, m := range r.members { // back in the lobby: the ready clock restarts
+		m.lobbySince, m.readyWarned = now, false
+	}
 	r.broadcast(lobbyMessage{Type: "lobby", Players: r.lobby()})
 }
 
@@ -213,10 +244,32 @@ func rank(racers []*member) []rankEntry {
 	return ranking
 }
 
+// paletteSize matches the client's player palette.
+const paletteSize = 8
+
+// freeColor picks a random palette slot nobody in the room is using, so every
+// client shows each player in the same, distinct color.
+func (r *room) freeColor() int {
+	used := map[int]bool{}
+	for _, m := range r.members {
+		used[m.color] = true
+	}
+	var free []int
+	for color := range paletteSize {
+		if !used[color] {
+			free = append(free, color)
+		}
+	}
+	if len(free) == 0 { // more players than colors
+		return rand.IntN(paletteSize)
+	}
+	return free[rand.IntN(len(free))]
+}
+
 func (r *room) lobby() []playerInfo {
 	players := make([]playerInfo, len(r.members))
 	for i, m := range r.members {
-		players[i] = playerInfo{PlayerID: m.id, Name: m.name, Ready: m.ready}
+		players[i] = playerInfo{PlayerID: m.id, Name: m.name, Ready: m.ready, Color: m.color}
 	}
 	return players
 }

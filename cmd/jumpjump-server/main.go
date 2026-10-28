@@ -27,6 +27,7 @@ func main() {
 	addr := flag.String("addr", ":7788", "listen address")
 	bonjour := flag.Bool("bonjour", true, "advertise _jumpjump._tcp on the local network")
 	flag.DurationVar(&cfg.IdleTimeout, "idle", cfg.IdleTimeout, "forfeit a racer after this long without jumping")
+	flag.DurationVar(&cfg.ReadyTimeout, "ready-timeout", cfg.ReadyTimeout, "remove a room member who has not readied after this long")
 	flag.IntVar(&cfg.MinPlayers, "min-players", cfg.MinPlayers, "players needed before an all-ready room starts")
 	flag.IntVar(&cfg.MaxPlayers, "max-players", cfg.MaxPlayers, "room capacity")
 	flag.Parse()

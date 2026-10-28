@@ -43,10 +43,11 @@
 | type | 字段 | 说明 |
 | --- | --- | --- |
 | `welcome` | `playerID`, `players` | 加入成功；`playerID` 由服务器分配并绑定连接 |
-| `lobby` | `players: [{playerID, name, ready}]` | 房间成员或准备状态变化；对局结束后也会发一次（全员回到未准备） |
+| `lobby` | `players: [{playerID, name, ready, color}]` | 房间成员或准备状态变化；对局结束后也会发一次（全员回到未准备）。`color` 是 0–7 的调色板序号，加入时由服务器在房间内未占用的颜色里随机分配，所有客户端（包括本人）都用它给该玩家上色 |
 | `start` | `seed`, `countdownMs` | 倒计时后开跑；客户端用 `seed` 生成平台（Go 生成器已与 Swift 逐位一致） |
 | `charge` | `playerID`, `seq` | 转发蓄力 |
 | `jumped` | `playerID`, `seq`, `pressMs`, `landingBits`, `result`, `score`, `combo` | 权威结果；`landingBits` 为落点 x,z 的 float32 位模式，避免十进制往返误差 |
+| `readyWarning` | `secondsLeft` | 只发给在房间里迟迟不准备、即将被移出的玩家 |
 | `idleWarning` | `secondsLeft` | 只发给即将被判挂机的玩家 |
 | `out` | `playerID`, `reason` | `fell` / `idle` / `disconnected` / `left` |
 | `result` | `ranking: [{playerID, score, status}]` | 全员出局后的排名 |
@@ -58,6 +59,7 @@
 2. 房间人数达到下限（默认 2 人）且全员 `ready` 后发 `start`，倒计时（默认 3 秒）结束后开跑。
 3. 对局中不能加入（`room_busy`），满员（默认 4 人）返回 `room_full`。
 4. 全员出局后发 `result`，房间回到准备阶段，可以再来一局。
+5. 准备阶段（刚进房间，或一局结束回到房间）15 秒内（`-ready-timeout`）没有 `ready` 的玩家会被移出房间：第 10 秒发 `readyWarning`，第 15 秒回 `error`（`ready_timeout`）并断开。被移出后如果其余人都已准备，立即开局。
 
 ## 服务器校验
 
@@ -67,7 +69,7 @@
 - 单条消息 ≤ 4KB，每秒最多 20 条；超限、JSON 格式错误（包括 `pressMs` 不是整数）直接断开。未知 `type` 回 `error` 后断开。
 - 每 10 秒 ping 一次，无响应按断线处理。
 
-错误码：`not_joined`、`already_joined`、`bad_name`、`bad_room_code`、`room_busy`、`room_full`、`not_in_lobby`、`not_racing`、`bad_charge`、`bad_press`、`bad_seq`、`too_early`、`unknown_type`。
+错误码：`ready_timeout`、`not_joined`、`already_joined`、`bad_name`、`bad_room_code`、`room_busy`、`room_full`、`not_in_lobby`、`not_racing`、`bad_charge`、`bad_press`、`bad_seq`、`too_early`、`unknown_type`。
 
 ## 规则
 
