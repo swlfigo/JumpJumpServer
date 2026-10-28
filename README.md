@@ -9,7 +9,28 @@ JumpJump 跳一跳的联机对战服务器（Go）。
 | 模块 | 状态 |
 | --- | --- |
 | `internal/game` | 已完成：客户端 `GameLogic.swift` 的逐位一致移植（平台生成、跳跃轨迹、落点判定、计分） |
-| 网络层（房间、WebSocket、Bonjour） | 未开始，协议草案见 [docs/protocol.md](docs/protocol.md) |
+| `internal/server` | 已完成 v0：房间、WebSocket、服务器权威判定、作弊校验、挂机判负、断线出局、排名 |
+| `cmd/jumpjump-server` | 已完成：命令行入口、Bonjour 广播 |
+| iOS 客户端联机 | 未开始 |
+
+协议见 [docs/protocol.md](docs/protocol.md)。
+
+## 运行
+
+```sh
+go run ./cmd/jumpjump-server                  # 默认 :7788，路径 /ws
+go run ./cmd/jumpjump-server -min-players 1   # 单人调试
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-addr` | `:7788` | 监听地址 |
+| `-bonjour` | `true` | 在局域网广播 `_jumpjump._tcp` |
+| `-idle` | `1m0s` | 多久不起跳判挂机出局 |
+| `-min-players` | `2` | 全员准备后开局所需人数 |
+| `-max-players` | `4` | 房间上限 |
+
+启动日志会打印可连接的 `ws://IP:端口/ws`。手机和电脑需在同一 Wi-Fi 下。
 
 ## 测试
 
