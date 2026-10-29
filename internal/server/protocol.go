@@ -3,6 +3,7 @@ package server
 // Wire messages; see docs/protocol.md. Every message is a JSON object with a "type".
 
 const (
+	typeCreate = "create"
 	typeJoin   = "join"
 	typeReady  = "ready"
 	typeCharge = "charge"
@@ -15,7 +16,8 @@ const (
 type clientMessage struct {
 	Type     string `json:"type"`
 	Name     string `json:"name"`
-	RoomCode string `json:"roomCode"`
+	RoomID   int    `json:"roomID"`
+	Password string `json:"password"`
 	Seq      int    `json:"seq"`
 	PressMs  *int   `json:"pressMs"`
 }
@@ -27,8 +29,24 @@ type playerInfo struct {
 	Color    int    `json:"color"` // slot in the client's palette, unique within the room
 }
 
+// roomInfo is a room as the room list shows it; the password stays on the server.
+type roomInfo struct {
+	RoomID     int    `json:"roomID"`
+	Host       string `json:"host"` // the longest-standing member's name
+	Players    int    `json:"players"`
+	MaxPlayers int    `json:"maxPlayers"`
+	Locked     bool   `json:"locked"` // joining needs the password
+	Racing     bool   `json:"racing"`
+}
+
+type roomsMessage struct {
+	Type  string     `json:"type"`
+	Rooms []roomInfo `json:"rooms"`
+}
+
 type welcomeMessage struct {
 	Type     string       `json:"type"`
+	RoomID   int          `json:"roomID"`
 	PlayerID int          `json:"playerID"`
 	Players  []playerInfo `json:"players"`
 }

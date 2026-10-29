@@ -13,11 +13,12 @@ import (
 
 // room is touched only by the hub goroutine.
 type room struct {
-	code    string
-	cfg     Config
-	log     *slog.Logger
-	members []*member // connected, in join order
-	nextID  int
+	id       int
+	password string // empty for an open room
+	cfg      Config
+	log      *slog.Logger
+	members  []*member // connected, in join order
+	nextID   int
 
 	// The current match; racers is nil while the room is in the lobby.
 	// Racers who disconnect stay here so they still appear in the ranking.
@@ -54,7 +55,7 @@ func (r *room) add(c *client, name string, now time.Time) {
 	c.member = m
 	r.members = append(r.members, m)
 	r.log.Info("join", "player", m.id, "name", name)
-	c.enqueue(welcomeMessage{Type: "welcome", PlayerID: m.id, Players: r.lobby()})
+	c.enqueue(welcomeMessage{Type: "welcome", RoomID: r.id, PlayerID: m.id, Players: r.lobby()})
 	r.broadcast(lobbyMessage{Type: "lobby", Players: r.lobby()})
 }
 
@@ -272,6 +273,13 @@ func (r *room) lobby() []playerInfo {
 		players[i] = playerInfo{PlayerID: m.id, Name: m.name, Ready: m.ready, Color: m.color}
 	}
 	return players
+}
+
+// info describes the room for the room list. Whoever has been in it longest
+// is shown as its host, so the room keeps a name after its creator leaves.
+func (r *room) info() roomInfo {
+	return roomInfo{RoomID: r.id, Host: r.members[0].name, Players: len(r.members), MaxPlayers: r.cfg.MaxPlayers,
+		Locked: r.password != "", Racing: r.racing()}
 }
 
 func (r *room) broadcast(v any) {

@@ -61,10 +61,26 @@ func (c *testClient) send(v any) {
 	}
 }
 
-func (c *testClient) join(name, room string) int {
+// create opens a room and returns the creator's welcome, which has the room ID.
+func (c *testClient) create(name, password string) welcomeMessage {
 	c.t.Helper()
-	c.send(map[string]any{"type": "join", "name": name, "roomCode": room})
+	c.send(map[string]any{"type": "create", "name": name, "password": password})
+	return expect[welcomeMessage](c, "welcome")
+}
+
+// join enters an open room and returns the player ID.
+func (c *testClient) join(name string, roomID int) int {
+	c.t.Helper()
+	c.send(map[string]any{"type": "join", "name": name, "roomID": roomID})
 	return expect[welcomeMessage](c, "welcome").PlayerID
+}
+
+// pair puts two new clients in a fresh open room.
+func pair(t *testing.T, url string) (a, b *testClient, aID, bID int) {
+	t.Helper()
+	a, b = dial(t, url), dial(t, url)
+	welcome := a.create("A", "")
+	return a, b, welcome.PlayerID, b.join("B", welcome.RoomID)
 }
 
 func (c *testClient) jump(seq, pressMs int) {
@@ -150,8 +166,7 @@ func startMatch(t *testing.T, clients ...*testClient) int {
 
 func TestMatchFlow(t *testing.T) {
 	url := startServer(t, testConfig())
-	a, b := dial(t, url), dial(t, url)
-	aID, bID := a.join("A", "room"), b.join("B", "room")
+	a, b, aID, bID := pair(t, url)
 	seed := startMatch(t, a, b)
 	course := game.NewCourse(seed)
 	var predicted game.Player
@@ -205,10 +220,9 @@ func TestRejectsInvalidJumps(t *testing.T) {
 	stranger := dial(t, url)
 	stranger.jump(1, 0)
 	stranger.expectError("not_joined")
-	stranger.expectClosed()
 
 	a := dial(t, url)
-	a.join("A", "solo")
+	a.create("A", "")
 	startMatch(t, a)
 	a.jump(2, 0)
 	a.expectError("bad_seq")
@@ -224,13 +238,13 @@ func TestRejectsInvalidJumps(t *testing.T) {
 	a.expectClosed()
 
 	b := dial(t, url)
-	b.join("B", "other")
+	b.create("B", "")
 	b.send(map[string]any{"type": "teleport", "x": 100})
 	b.expectError("unknown_type")
 	b.expectClosed()
 
 	c := dial(t, url)
-	c.send(map[string]any{"type": "join", "name": strings.Repeat("x", 5000), "roomCode": "big"})
+	c.send(map[string]any{"type": "create", "name": strings.Repeat("x", 5000)})
 	c.expectClosed()
 }
 
@@ -239,7 +253,7 @@ func TestRejectsEarlyJumps(t *testing.T) {
 	cfg.MinPlayers, cfg.JitterTolerance = 1, 0
 	url := startServer(t, cfg)
 	a := dial(t, url)
-	a.join("A", "solo")
+	a.create("A", "")
 	startMatch(t, a)
 	a.jump(1, 500) // released 500ms into a match that started 20ms ago
 	a.expectError("too_early")
@@ -259,8 +273,7 @@ func TestIdleRacerForfeitsDespiteHigherScore(t *testing.T) {
 	cfg := testConfig()
 	cfg.IdleTimeout, cfg.IdleWarning = 300*time.Millisecond, 200*time.Millisecond
 	url := startServer(t, cfg)
-	a, b := dial(t, url), dial(t, url)
-	aID, bID := a.join("A", "room"), b.join("B", "room")
+	a, b, aID, bID := pair(t, url)
 	course := game.NewCourse(startMatch(t, a, b))
 
 	a.jump(1, perfectPress(t, course, game.Player{}))
@@ -286,8 +299,7 @@ func TestIdleRacerForfeitsDespiteHigherScore(t *testing.T) {
 
 func TestDisconnectForfeits(t *testing.T) {
 	url := startServer(t, testConfig())
-	a, b := dial(t, url), dial(t, url)
-	aID, bID := a.join("A", "room"), b.join("B", "room")
+	a, b, aID, bID := pair(t, url)
 	startMatch(t, a, b)
 	b.conn.CloseNow()
 	if got := expect[outMessage](a, "out"); got.PlayerID != bID || got.Reason != reasonDisconnected {
@@ -304,10 +316,10 @@ func TestPlayersGetDistinctColors(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxPlayers = paletteSize
 	url := startServer(t, cfg)
-	var last welcomeMessage
-	for i := range paletteSize {
+	last := dial(t, url).create("A", "")
+	for i := 1; i < paletteSize; i++ {
 		c := dial(t, url)
-		c.send(map[string]any{"type": "join", "name": string(rune('A' + i)), "roomCode": "colors"})
+		c.send(map[string]any{"type": "join", "name": string(rune('A' + i)), "roomID": last.RoomID})
 		last = expect[welcomeMessage](c, "welcome")
 	}
 	seen := map[int]bool{}
@@ -323,15 +335,16 @@ func TestUnreadyMemberIsWarnedThenRemoved(t *testing.T) {
 	cfg := testConfig()
 	cfg.ReadyTimeout, cfg.ReadyWarning = 400*time.Millisecond, 250*time.Millisecond
 	url := startServer(t, cfg)
-	a, b := dial(t, url), dial(t, url)
-	aID := a.join("A", "room")
-	b.join("B", "room")
+	a, b, aID, _ := pair(t, url)
 	a.send(map[string]any{"type": "ready"})
 	if got := expect[readyWarningMessage](b, "readyWarning"); got.SecondsLeft != 1 {
 		t.Fatalf("ready warning: %+v", got)
 	}
 	b.expectError("ready_timeout")
-	b.expectClosed()
+	// B is back on the room list, still connected.
+	if got := expect[roomsMessage](b, "rooms"); len(got.Rooms) != 1 || got.Rooms[0].Players != 1 {
+		t.Fatalf("room list after removal: %+v", got)
+	}
 	// A readied in time and stays, now alone in the room.
 	for {
 		lobby := expect[lobbyMessage](a, "lobby")
@@ -345,9 +358,7 @@ func TestReadyClockRestartsAfterRace(t *testing.T) {
 	cfg := testConfig()
 	cfg.ReadyTimeout, cfg.ReadyWarning = 400*time.Millisecond, 250*time.Millisecond
 	url := startServer(t, cfg)
-	a, b := dial(t, url), dial(t, url)
-	a.join("A", "room")
-	b.join("B", "room")
+	a, b, _, _ := pair(t, url)
 	startMatch(t, a, b)
 	time.Sleep(500 * time.Millisecond) // longer than the ready timeout
 	a.jump(1, 3000)
@@ -364,14 +375,66 @@ func TestRoomFullAndBusy(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxPlayers = 2
 	url := startServer(t, cfg)
-	a, b := dial(t, url), dial(t, url)
-	a.join("A", "room")
-	b.join("B", "room")
+	a, b, _, _ := pair(t, url)
+	roomID := expect[roomsMessage](dial(t, url), "rooms").Rooms[0].RoomID
 	c := dial(t, url)
-	c.send(map[string]any{"type": "join", "name": "C", "roomCode": "room"})
+	c.send(map[string]any{"type": "join", "name": "C", "roomID": roomID})
 	c.expectError("room_full")
 	startMatch(t, a, b)
-	d := dial(t, url)
-	d.send(map[string]any{"type": "join", "name": "D", "roomCode": "room"})
-	d.expectError("room_busy")
+	c.send(map[string]any{"type": "join", "name": "C", "roomID": roomID})
+	c.expectError("room_busy")
+	c.send(map[string]any{"type": "join", "name": "C", "roomID": roomID + 1})
+	c.expectError("no_room")
+	c.create("C", "") // refusals leave the connection on the room list
+}
+
+// nextRooms reads room lists until one satisfies ok.
+func nextRooms(c *testClient, ok func([]roomInfo) bool) []roomInfo {
+	c.t.Helper()
+	for {
+		if rooms := expect[roomsMessage](c, "rooms").Rooms; ok(rooms) {
+			return rooms
+		}
+	}
+}
+
+func TestRoomList(t *testing.T) {
+	url := startServer(t, testConfig())
+	watcher := dial(t, url)
+	if got := expect[roomsMessage](watcher, "rooms"); got.Rooms == nil || len(got.Rooms) != 0 {
+		t.Fatalf("initial list: %+v", got)
+	}
+
+	a := dial(t, url)
+	a.send(map[string]any{"type": "create", "name": "A", "password": strings.Repeat("p", 17)})
+	a.expectError("bad_password")
+	roomID := a.create("A", " 1234 ").RoomID
+	rooms := nextRooms(watcher, func(r []roomInfo) bool { return len(r) == 1 })
+	if want := (roomInfo{RoomID: roomID, Host: "A", Players: 1, MaxPlayers: 4, Locked: true}); rooms[0] != want {
+		t.Fatalf("listed %+v, want %+v", rooms[0], want)
+	}
+
+	// A wrong password is refused without closing; the right one gets in.
+	b := dial(t, url)
+	b.send(map[string]any{"type": "join", "name": "B", "roomID": roomID})
+	b.expectError("wrong_password")
+	b.send(map[string]any{"type": "join", "name": "B", "roomID": roomID, "password": "4321"})
+	b.expectError("wrong_password")
+	b.send(map[string]any{"type": "join", "name": "B", "roomID": roomID, "password": "1234"})
+	expect[welcomeMessage](b, "welcome")
+	nextRooms(watcher, func(r []roomInfo) bool { return len(r) == 1 && r[0].Players == 2 })
+
+	other := dial(t, url).create("C", "")
+	nextRooms(watcher, func(r []roomInfo) bool { return len(r) == 2 && r[1].RoomID == other.RoomID && !r[1].Locked })
+
+	startMatch(t, a, b)
+	nextRooms(watcher, func(r []roomInfo) bool { return r[0].Racing })
+
+	// Leaving goes back to the list. The room stays with B, who is now its host,
+	// and closes once B leaves too.
+	a.send(map[string]any{"type": "leave"})
+	nextRooms(a, func(r []roomInfo) bool { return len(r) == 2 && r[0].Host == "B" && r[0].Players == 1 })
+	b.send(map[string]any{"type": "leave"})
+	nextRooms(watcher, func(r []roomInfo) bool { return len(r) == 1 && r[0].RoomID == other.RoomID })
+	a.create("A", "")
 }

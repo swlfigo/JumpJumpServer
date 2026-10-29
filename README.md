@@ -9,7 +9,7 @@ JumpJump 跳一跳的联机对战服务器（Go）。
 | 模块 | 状态 |
 | --- | --- |
 | `internal/game` | 已完成：客户端 `GameLogic.swift` 的逐位一致移植（平台生成、跳跃轨迹、落点判定、计分） |
-| `internal/server` | 已完成 v0：房间、WebSocket、服务器权威判定、作弊校验、挂机判负、断线出局、排名 |
+| `internal/server` | 已完成 v0：房间列表与房间密码、WebSocket、服务器权威判定、作弊校验、挂机判负、断线出局、排名 |
 | `cmd/jumpjump-server` | 已完成：命令行入口、Bonjour 广播 |
 | `cmd/jumpbot` | 已完成：练习用机器人对手 |
 | iOS 客户端联机 | 已完成 v0（iOS 仓库 `explore/multiplayer` 分支） |
@@ -36,21 +36,23 @@ go run ./cmd/jumpjump-server -min-players 1   # 单人调试
 
 ### 机器人对手
 
-一个人测试时，可以让机器人先进房间等你：
+一个人测试时，可以让机器人先开一个房间等你，房间列表里显示为「Bot 的房间」：
 
 ```sh
-go run ./cmd/jumpbot -room 1 -name Bot            # 一直跳到失误为止
-go run ./cmd/jumpbot -room 1 -name Bot -jumps 8   # 跳 8 次后故意掉落
+go run ./cmd/jumpbot -name Bot                    # 一直跳到失误为止
+go run ./cmd/jumpbot -name Bot -jumps 8           # 跳 8 次后故意掉落
+go run ./cmd/jumpbot -name Bot -password 1234     # 加锁的房间，凭密码 1234 进入
 ```
 
-机器人每局结束后自动准备，可以连续再来一局。`-error` 调整按压误差（毫秒，默认 40）；`-rejoin 20s` 让它每局结束就离开房间、20 秒后再回来，用来测"对手走了"的情况。
+机器人每局结束后自动准备，可以连续再来一局。`-error` 调整按压误差（毫秒，默认 40）；`-rejoin 20s` 让它每局结束就离开房间、20 秒后再开一个新房间，用来测"对手走了"的情况。
 
 ### iOS 联机 UI 测试
 
 ```sh
 go run ./cmd/jumpjump-server &
-go run ./cmd/jumpbot -room uitest -name Bot -jumps 8 &
-go run ./cmd/jumpbot -room uitest-leave -name Bot -jumps 6 -rejoin 20s &
+go run ./cmd/jumpbot -name Bot -jumps 8 &
+go run ./cmd/jumpbot -name LeaveBot -jumps 6 -rejoin 20s &
+go run ./cmd/jumpbot -name LockBot -password 1234 &
 cd ../JumpJump
 TEST_RUNNER_JUMPJUMP_ONLINE_TEST=1 xcodebuild test -project JumpJump.xcodeproj -scheme JumpJump \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
@@ -58,17 +60,21 @@ TEST_RUNNER_JUMPJUMP_ONLINE_TEST=1 xcodebuild test -project JumpJump.xcodeproj -
   -only-testing:JumpJumpUITests/JumpJumpUITests/testOnlineDisablesAssist \
   -only-testing:JumpJumpUITests/JumpJumpUITests/testOnlineRematchAloneReturnsHome \
   -only-testing:JumpJumpUITests/JumpJumpUITests/testOnlineReadyTimeoutLeavesRoom \
-  -only-testing:JumpJumpUITests/JumpJumpUITests/testOnlineResultTimeoutReturnsHome
+  -only-testing:JumpJumpUITests/JumpJumpUITests/testOnlineResultTimeoutReturnsHome \
+  -only-testing:JumpJumpUITests/JumpJumpUITests/testOnlineLockedRoomNeedsPassword
 ```
 
-测试覆盖 Bonjour 发现、加入房间、开局、起跳得分、本地预测与服务器逐位一致、掉落观战、最后一人掉落动画结束后才出结算、再来一局、对手离开后再来一局回到首页、房间里或结算后迟迟不准备被移出、退出联机，以及联机时辅助功能不可用。
+测试覆盖 Bonjour 发现、房间列表、创建房间、加锁房间输错/输对密码、离开房间回到列表、开局、起跳得分、本地预测与服务器逐位一致、掉落观战、最后一人掉落动画结束后才出结算、再来一局、对手离开后再来一局回到首页、房间里或结算后迟迟不准备被移出、退出联机，以及联机时辅助功能不可用。
+
+另有一个测试 `testOnlineWithoutServerExplains` 检查局域网里没有服务器时大厅会说明原因，要在**没有任何 jumpjump-server 运行**时单独跑，用 `TEST_RUNNER_JUMPJUMP_NO_SERVER_TEST=1` 代替上面的环境变量。
 
 如果 7788 端口已经有服务器在跑（比如你正在手动测试），可以另开一个不广播的私有服务器给测试用，并让测试直接填地址：
 
 ```sh
 go run ./cmd/jumpjump-server -addr :7790 -bonjour=false &
-go run ./cmd/jumpbot -url ws://127.0.0.1:7790/ws -room uitest -name Bot -jumps 8 &
-go run ./cmd/jumpbot -url ws://127.0.0.1:7790/ws -room uitest-leave -name Bot -jumps 6 -rejoin 20s &
+go run ./cmd/jumpbot -url ws://127.0.0.1:7790/ws -name Bot -jumps 8 &
+go run ./cmd/jumpbot -url ws://127.0.0.1:7790/ws -name LeaveBot -jumps 6 -rejoin 20s &
+go run ./cmd/jumpbot -url ws://127.0.0.1:7790/ws -name LockBot -password 1234 &
 # 上面的 xcodebuild 命令前再加 TEST_RUNNER_JUMPJUMP_SERVER=127.0.0.1:7790
 ```
 

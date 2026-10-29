@@ -1,4 +1,4 @@
-// Command jumpbot is a practice opponent: it joins a room, readies up and
+// Command jumpbot is a practice opponent: it opens a room, readies up and
 // jumps like a decent human, with a little press error, until it falls.
 package main
 
@@ -20,6 +20,7 @@ import (
 
 type message struct {
 	Type        string `json:"type"`
+	RoomID      int    `json:"roomID"`
 	PlayerID    int    `json:"playerID"`
 	Seed        int    `json:"seed"`
 	CountdownMs int    `json:"countdownMs"`
@@ -31,15 +32,15 @@ type message struct {
 
 func main() {
 	url := flag.String("url", "ws://127.0.0.1:7788/ws", "server WebSocket URL")
-	room := flag.String("room", "1", "room code")
-	name := flag.String("name", "Bot", "display name")
+	name := flag.String("name", "Bot", "display name; the room is listed as this name's room")
+	password := flag.String("password", "", "lock the room with this password")
 	jumps := flag.Int("jumps", 0, "deliberately fall after this many jumps (0 = keep going)")
 	errorMs := flag.Float64("error", 40, "standard deviation of the press error in ms")
-	rejoin := flag.Duration("rejoin", 0, "leave after each match and rejoin this much later (0 = stay for rematches)")
+	rejoin := flag.Duration("rejoin", 0, "leave after each match and open a new room this much later (0 = stay for rematches)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	for {
-		if err := session(*url, *room, *name, *jumps, *errorMs, *rejoin == 0, log); err != nil {
+		if err := session(*url, *name, *password, *jumps, *errorMs, *rejoin == 0, log); err != nil {
 			log.Error("session", "err", err)
 			os.Exit(1)
 		}
@@ -48,9 +49,9 @@ func main() {
 	}
 }
 
-// session joins the room and plays; it returns after one match unless the
+// session opens a room and plays; it returns after one match unless the
 // bot stays for rematches.
-func session(url, room, name string, jumps int, errorMs float64, stay bool, log *slog.Logger) error {
+func session(url, name, password string, jumps int, errorMs float64, stay bool, log *slog.Logger) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, url, nil)
@@ -83,11 +84,12 @@ func session(url, room, name string, jumps int, errorMs float64, stay bool, log 
 		}
 	}()
 
-	send(map[string]any{"type": "join", "name": name, "roomCode": room})
+	send(map[string]any{"type": "create", "name": name, "password": password})
 	var self int
 	for m := range incoming {
 		switch m.Type {
 		case "welcome":
+			log.Info("opened a room", "room", m.RoomID, "locked", password != "")
 			self = m.PlayerID
 			send(map[string]any{"type": "ready"})
 		case "start":

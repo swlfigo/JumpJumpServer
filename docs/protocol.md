@@ -20,7 +20,7 @@
 
   客户端用 `NWBrowser` 发现服务后，**直接按 `addrs` 里的地址依次连接** `ws://<addr>:<port><path>`，不要解析服务的主机名：广播库不会否定应答 IPv6（AAAA）查询，系统解析器会白等约 5 秒。
 - 也可以手动输入服务器启动日志里打印的 `ws://IP:端口/ws`。
-- 公网（以后）：`wss://`，Bonjour 换成房间码。
+- 公网（以后）：`wss://`，服务器地址改为手动输入或固定域名；房间仍从房间列表里选。
 
 ## 原则：服务器权威
 
@@ -32,17 +32,19 @@
 
 | type | 字段 | 说明 |
 | --- | --- | --- |
-| `join` | `name`, `roomCode` | 进入房间 |
+| `create` | `name`, `password` | 创建房间并作为房主进入；`password` 为空表示不加锁，最多 16 个字（首尾空白会被去掉） |
+| `join` | `name`, `roomID`, `password` | 进入列表里的房间；加锁的房间要带正确的 `password` |
 | `ready` | | 准备 |
 | `charge` | `seq` | 开始蓄力（仅用于让别人看到下蹲动画） |
 | `jump` | `seq`, `pressMs` | 松手起跳；`seq` 为第几跳 |
-| `leave` | | 主动离开 |
+| `leave` | | 离开房间（对局中视为判负），回到房间列表；连接保持 |
 
 服务器 → 客户端：
 
 | type | 字段 | 说明 |
 | --- | --- | --- |
-| `welcome` | `playerID`, `players` | 加入成功；`playerID` 由服务器分配并绑定连接 |
+| `rooms` | `rooms: [{roomID, host, players, maxPlayers, locked, racing}]` | 房间列表，按创建顺序。只发给不在任何房间里的连接：连上时、回到列表时各发一次，之后列表有变化就推送。`host` 是房间里待得最久的人（房主离开后顺延）；`locked` 表示需要密码，密码本身不下发 |
+| `welcome` | `roomID`, `playerID`, `players` | 进入房间成功；`playerID` 由服务器分配并绑定连接 |
 | `lobby` | `players: [{playerID, name, ready, color}]` | 房间成员或准备状态变化；对局结束后也会发一次（全员回到未准备）。`color` 是 0–7 的调色板序号，加入时由服务器在房间内未占用的颜色里随机分配，所有客户端（包括本人）都用它给该玩家上色 |
 | `start` | `seed`, `countdownMs` | 倒计时后开跑；客户端用 `seed` 生成平台（Go 生成器已与 Swift 逐位一致） |
 | `charge` | `playerID`, `seq` | 转发蓄力 |
@@ -55,21 +57,22 @@
 
 ## 房间流程
 
-1. 连接后第一条消息必须是 `join`，否则断开。房间码相同即进入同一房间，房间不存在时自动创建。
-2. 房间人数达到下限（默认 2 人）且全员 `ready` 后发 `start`，倒计时（默认 3 秒）结束后开跑。
-3. 对局中不能加入（`room_busy`），满员（默认 4 人）返回 `room_full`。
+1. 连接后先在房间列表里（收 `rooms`）。用 `create` 开新房间，或用 `join` 进列表里的房间；最后一个人离开时房间关闭，从列表消失。
+2. 进房被拒（`no_room`、`room_busy`、`room_full`、`wrong_password`、`bad_name`、`bad_password`）只回 `error`，不断开，可以换房间或重输密码。对局中不能加入，满员默认 4 人。
+3. 房间人数达到下限（默认 2 人）且全员 `ready` 后发 `start`，倒计时（默认 3 秒）结束后开跑。
 4. 全员出局后发 `result`，房间回到准备阶段，可以再来一局。
-5. 准备阶段（刚进房间，或一局结束回到房间）15 秒内（`-ready-timeout`）没有 `ready` 的玩家会被移出房间：第 10 秒发 `readyWarning`，第 15 秒回 `error`（`ready_timeout`）并断开。被移出后如果其余人都已准备，立即开局。
+5. 准备阶段（刚进房间，或一局结束回到房间）15 秒内（`-ready-timeout`）没有 `ready` 的玩家会被移出房间：第 10 秒发 `readyWarning`，第 15 秒回 `error`（`ready_timeout`）并回到房间列表（不断开）。被移出后如果其余人都已准备，立即开局。
 
 ## 服务器校验
 
 - 身份只认连接，忽略客户端自报的 ID；消息里多出的字段（坐标、结果、分数）一律忽略。
+- 房间密码只用来挡住不认识的人，局域网 `ws://` 是明文传输，不要用真实密码。
 - `pressMs` 必须是 0–3000 的整数；`seq` 必须严格加 1。被拒绝的跳跃不生效，`seq` 不前进。
 - 只有存活且站稳的玩家才能起跳：本次起跳到达时间 ≥ 上一跳落地时间（或开跑时间）+ 0.2s 落地缓冲 + 本次按压时长 − 网络抖动余量（默认 300ms）。
-- 单条消息 ≤ 4KB，每秒最多 20 条；超限、JSON 格式错误（包括 `pressMs` 不是整数）直接断开。未知 `type` 回 `error` 后断开。
+- 单条消息 ≤ 4KB，每秒最多 20 条；超限、JSON 格式错误（包括 `pressMs` 不是整数）直接断开。未知 `type` 回 `error` 后断开。不在房间里发 `ready`/`charge`/`jump` 回 `not_joined`，不断开。
 - 每 10 秒 ping 一次，无响应按断线处理。
 
-错误码：`ready_timeout`、`not_joined`、`already_joined`、`bad_name`、`bad_room_code`、`room_busy`、`room_full`、`not_in_lobby`、`not_racing`、`bad_charge`、`bad_press`、`bad_seq`、`too_early`、`unknown_type`。
+错误码：`ready_timeout`、`not_joined`、`already_joined`、`bad_name`、`bad_password`、`no_room`、`wrong_password`、`room_busy`、`room_full`、`not_in_lobby`、`not_racing`、`bad_charge`、`bad_press`、`bad_seq`、`too_early`、`unknown_type`。
 
 ## 规则
 

@@ -3,10 +3,13 @@
 package server
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -51,16 +54,22 @@ func DefaultConfig() Config {
 // Hub owns every room. Game state is only touched by the Run goroutine;
 // connection goroutines reach it through events, so nothing needs a lock.
 type Hub struct {
-	cfg     Config
-	log     *slog.Logger
-	events  chan event
-	stopped chan struct{}
-	rooms   map[string]*room
+	cfg        Config
+	log        *slog.Logger
+	events     chan event
+	stopped    chan struct{}
+	rooms      map[int]*room
+	nextRoomID int
+	// Connections outside any room, which are shown the room list; true once
+	// a client has the latest list.
+	browsers  map[*client]bool
+	roomsSent []byte // the latest list sent to browsers
 }
 
 type event struct {
 	client *client
 	msg    clientMessage
+	opened bool // a new connection; msg is empty
 	closed bool // the connection is gone; msg is empty
 }
 
@@ -79,7 +88,8 @@ func NewHub(cfg Config, log *slog.Logger) *Hub {
 	if cfg.ReadyWarning >= cfg.ReadyTimeout {
 		cfg.ReadyWarning = cfg.ReadyTimeout / 3
 	}
-	return &Hub{cfg: cfg, log: log, events: make(chan event), stopped: make(chan struct{}), rooms: map[string]*room{}}
+	return &Hub{cfg: cfg, log: log, events: make(chan event), stopped: make(chan struct{}),
+		rooms: map[int]*room{}, browsers: map[*client]bool{}}
 }
 
 func (h *Hub) Run(ctx context.Context) {
@@ -95,10 +105,12 @@ func (h *Hub) Run(ctx context.Context) {
 		case now := <-ticker.C:
 			for _, r := range h.rooms {
 				for _, c := range r.tick(now) {
-					h.kick(c, "ready_timeout", "did not ready in time", now)
+					c.reject("ready_timeout", "did not ready in time")
+					h.leave(c, "ready_timeout", now)
 				}
 			}
 		}
+		h.publishRooms()
 	}
 }
 
@@ -119,6 +131,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	go c.writeLoop(ctx, h.cfg.PingInterval)
+	h.post(event{client: c, opened: true})
 	h.readLoop(ctx, c)
 }
 
@@ -180,12 +193,12 @@ func (c *client) writeLoop(ctx context.Context, pingEvery time.Duration) {
 }
 
 func (c *client) enqueue(v any) {
+	c.enqueueData(marshal(v))
+}
+
+func (c *client) enqueueData(data []byte) {
 	if c.closed {
 		return
-	}
-	data, err := json.Marshal(v)
-	if err != nil {
-		panic(err) // only our own message types are sent
 	}
 	select {
 	case c.send <- data:
@@ -193,6 +206,14 @@ func (c *client) enqueue(v any) {
 		// A client this far behind is gone in practice; the reader reports it.
 		c.conn.CloseNow()
 	}
+}
+
+func marshal(v any) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err) // only our own message types are sent
+	}
+	return data
 }
 
 func (c *client) reject(code, message string) {
@@ -204,17 +225,27 @@ func (h *Hub) handle(ev event, now time.Time) {
 	if c.closed {
 		return
 	}
-	if ev.closed {
+	switch {
+	case ev.opened:
+		h.browsers[c] = false
+		return
+	case ev.closed:
 		h.drop(c, reasonDisconnected, now)
 		return
 	}
 	m := c.member
 	if m == nil {
-		if ev.msg.Type != typeJoin {
-			h.kick(c, "not_joined", "first message must be join", now)
-			return
+		switch ev.msg.Type {
+		case typeCreate:
+			h.create(c, ev.msg, now)
+		case typeJoin:
+			h.join(c, ev.msg, now)
+		case typeLeave: // already out of any room
+		case typeReady, typeCharge, typeJump:
+			c.reject("not_joined", "not in a room")
+		default:
+			h.kick(c, "unknown_type", "unknown message type", now)
 		}
-		h.join(c, ev.msg, now)
 		return
 	}
 	switch ev.msg.Type {
@@ -225,37 +256,71 @@ func (h *Hub) handle(ev event, now time.Time) {
 	case typeJump:
 		m.room.jump(m, ev.msg, now)
 	case typeLeave:
-		h.drop(c, reasonLeft, now)
-	case typeJoin:
+		h.leave(c, reasonLeft, now)
+	case typeCreate, typeJoin:
 		c.reject("already_joined", "this connection is already in a room")
 	default:
 		h.kick(c, "unknown_type", "unknown message type", now)
 	}
 }
 
+// create opens a room with the client as its host. An empty password leaves
+// it open to everyone.
+func (h *Hub) create(c *client, msg clientMessage, now time.Time) {
+	name, password := strings.TrimSpace(msg.Name), strings.TrimSpace(msg.Password)
+	if !validName(name) {
+		c.reject("bad_name", "name must be 1-16 characters")
+		return
+	}
+	if utf8.RuneCountInString(password) > 16 {
+		c.reject("bad_password", "password must be at most 16 characters")
+		return
+	}
+	h.nextRoomID++
+	r := &room{id: h.nextRoomID, password: password, cfg: h.cfg, log: h.log.With("room", h.nextRoomID)}
+	h.rooms[r.id] = r
+	r.log.Info("create", "locked", password != "")
+	h.enter(c, r, name, now)
+}
+
+// join enters a room from the list. Refusals leave the client on the list,
+// free to pick another room or retype the password.
 func (h *Hub) join(c *client, msg clientMessage, now time.Time) {
-	name, code := strings.TrimSpace(msg.Name), strings.TrimSpace(msg.RoomCode)
-	if n := utf8.RuneCountInString(name); n == 0 || n > 16 {
-		h.kick(c, "bad_name", "name must be 1-16 characters", now)
-		return
-	}
-	if n := utf8.RuneCountInString(code); n == 0 || n > 16 {
-		h.kick(c, "bad_room_code", "room code must be 1-16 characters", now)
-		return
-	}
-	r := h.rooms[code]
-	if r == nil {
-		r = &room{code: code, cfg: h.cfg, log: h.log.With("room", code)}
-		h.rooms[code] = r
-	}
+	name := strings.TrimSpace(msg.Name)
+	r := h.rooms[msg.RoomID]
 	switch {
+	case !validName(name):
+		c.reject("bad_name", "name must be 1-16 characters")
+	case r == nil:
+		c.reject("no_room", "the room no longer exists")
 	case r.racing():
-		h.kick(c, "room_busy", "a match is in progress", now)
+		c.reject("room_busy", "a match is in progress")
 	case len(r.members) >= h.cfg.MaxPlayers:
-		h.kick(c, "room_full", "room is full", now)
+		c.reject("room_full", "room is full")
+	case strings.TrimSpace(msg.Password) != r.password:
+		c.reject("wrong_password", "wrong room password")
 	default:
-		r.add(c, name, now)
+		h.enter(c, r, name, now)
 	}
+}
+
+func validName(name string) bool {
+	n := utf8.RuneCountInString(name)
+	return n > 0 && n <= 16
+}
+
+func (h *Hub) enter(c *client, r *room, name string, now time.Time) {
+	delete(h.browsers, c)
+	r.add(c, name, now)
+}
+
+// leave takes the client out of its room, forfeiting any match in progress,
+// and back to the room list.
+func (h *Hub) leave(c *client, reason string, now time.Time) {
+	m := c.member
+	c.member = nil
+	h.removeMember(m, reason, now)
+	h.browsers[c] = false
 }
 
 func (h *Hub) kick(c *client, code, message string, now time.Time) {
@@ -271,12 +336,38 @@ func (h *Hub) drop(c *client, reason string, now time.Time) {
 	}
 	c.closed = true
 	close(c.send)
-	m := c.member
-	if m == nil {
-		return
+	delete(h.browsers, c)
+	if m := c.member; m != nil {
+		h.removeMember(m, reason, now)
 	}
+}
+
+func (h *Hub) removeMember(m *member, reason string, now time.Time) {
 	m.room.remove(m, reason, now)
 	if len(m.room.members) == 0 {
-		delete(h.rooms, m.room.code)
+		delete(h.rooms, m.room.id)
+		m.room.log.Info("close")
+	}
+}
+
+// publishRooms keeps browsers' room lists current: everyone gets the list
+// when it changes, newcomers get it regardless.
+func (h *Hub) publishRooms() {
+	if len(h.browsers) == 0 {
+		return
+	}
+	rooms := make([]roomInfo, 0, len(h.rooms))
+	for _, r := range h.rooms {
+		rooms = append(rooms, r.info())
+	}
+	slices.SortFunc(rooms, func(a, b roomInfo) int { return cmp.Compare(a.RoomID, b.RoomID) })
+	data := marshal(roomsMessage{Type: "rooms", Rooms: rooms})
+	changed := !bytes.Equal(data, h.roomsSent)
+	h.roomsSent = data
+	for c, current := range h.browsers {
+		if changed || !current {
+			c.enqueueData(data)
+			h.browsers[c] = true
+		}
 	}
 }
